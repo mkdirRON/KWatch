@@ -1,17 +1,28 @@
 package main
 
+import "sync"
 
-import (
-	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net/http"
-	"github.com/segmentio/kafka-go"
-)
+type MetricsStore struct {
+	LagMap map[string]int
+	mu     sync.Mutex
+}
 
+type KakfaConfig struct {
+	topic string
+	groupId string
+	kafkaAddr string
+}
+
+func kafkaPoll(metric *MetricsStore, kafkaConfig *KakfaConfig) error {}
 
 func main() {
 
-	fmt.Print("hello world!")
+	metrics := MetricsStore{
+		LagMap: make(map[string]int),
+	}
+	kafkaInstance := KakfaConfig{
+		topic: "orders",
+		groupId: "order_consumer_1",
+		kafkaAddr: "localhost:9092",
+	}
 }
