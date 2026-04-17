@@ -21,7 +21,7 @@ type KakfaConfig struct {
 	groupId string
 	kafkaAddr string
 }
-
+    /
 func kafkaPoll(metric *MetricsStore, kafkaConfig *KakfaConfig) error {
 	client := kafka.Client{
 		Addr: kafka.TCP(kafkaConfig.kafkaAddr),
@@ -41,6 +41,7 @@ func kafkaPoll(metric *MetricsStore, kafkaConfig *KakfaConfig) error {
 		return err
 	}
 	return nil
+	
 }
 
 
@@ -53,7 +54,11 @@ func main() {
 		topic: "orders",
 		groupId: "order_consumer_1",
 		kafkaAddr: "localhost:9092",
+
 	}
+    kafkaIns := kafkaPoll(&LagMap, &kafkaInstance)
+}
+
 
 
 
