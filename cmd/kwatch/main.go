@@ -29,7 +29,6 @@ func kafkaPoll(metric *MetricsStore, kafkaConfig *KakfaConfig) error {
 
 	offsetRequest := kafka.OffsetFetchRequest{
 		GroupID: kafkaConfig.groupId,
-
 		Topics: map[string][]int{
 			kafkaConfig.topic: {0},
 		},
