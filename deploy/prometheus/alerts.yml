@@ -1,0 +1,94 @@
+# Alert rules for Kafka consumer lag.
+#
+# The goal is to page while a consumer is still catching up, not after it has
+# already fallen far enough behind to lose data to retention. The growth and
+# stall rules below fire on trend; the absolute-threshold rules are the
+# backstop for lag that arrives faster than a trend can be measured.
+groups:
+  - name: kwatch-health
+    rules:
+      - alert: KWatchDown
+        expr: up{job="kwatch"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KWatch is not reachable"
+          description: "Prometheus cannot scrape KWatch, so consumer lag is unmonitored."
+
+      - alert: KWatchCannotReachKafka
+        expr: kwatch_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KWatch cannot reach the Kafka cluster"
+          description: >-
+            KWatch is serving metrics but its collection rounds against the
+            Kafka cluster are failing. The lag it reports is stale.
+
+      - alert: KWatchSlowCollection
+        expr: kwatch_scrape_duration_seconds > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KWatch collection is taking {{ $value | humanizeDuration }}"
+          description: >-
+            Collection is approaching the poll interval, so lag samples will
+            start being skipped.
+
+  - name: kafka-consumer-lag
+    rules:
+      # Trend rules: these are the ones meant to fire before a consumer has
+      # actually fallen behind.
+      - alert: KafkaConsumerLagGrowing
+        expr: |
+          predict_linear(kwatch_consumer_group_lag[15m], 30 * 60) > 10000
+            and kwatch_consumer_group_lag > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.group }} is falling behind on {{ $labels.topic }}"
+          description: >-
+            Lag on partition {{ $labels.partition }} is trending toward 10k
+            messages within 30 minutes. The group is consuming slower than the
+            topic is being produced to.
+
+      - alert: KafkaConsumerGroupStalled
+        expr: |
+          rate(kwatch_consumer_group_committed_offset[5m]) == 0
+            and on (topic, partition) rate(kwatch_topic_partition_end_offset[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.group }} has stopped committing on {{ $labels.topic }}"
+          description: >-
+            Partition {{ $labels.partition }} is still receiving messages but
+            the group's committed offset has not moved in 10 minutes. The
+            consumer is likely dead, wedged, or stuck in a rebalance loop.
+
+      # Absolute thresholds: the backstop for lag that spikes too fast for the
+      # trend rules to catch.
+      - alert: KafkaConsumerLagHigh
+        expr: kwatch_consumer_group_lag > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.group }} is {{ $value }} messages behind on {{ $labels.topic }}"
+          description: "Partition {{ $labels.partition }} has been over 10k messages behind for 10 minutes."
+
+      - alert: KafkaConsumerLagCritical
+        expr: kwatch_consumer_group_lag > 100000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.group }} is {{ $value }} messages behind on {{ $labels.topic }}"
+          description: >-
+            Partition {{ $labels.partition }} is over 100k messages behind.
+            At this depth the backlog is at risk of aging out of retention
+            before the group reaches it.

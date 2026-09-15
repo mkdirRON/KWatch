@@ -1,0 +1,92 @@
+# Local KWatch stack: Kafka, the KWatch service, Prometheus and Grafana.
+#
+#   docker compose up -d
+#   open http://localhost:3000   # Grafana, dashboard is pre-provisioned
+#   open http://localhost:9091   # Prometheus, alerts under Alerts
+#   open http://localhost:9090/metrics
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kwatch-kafka
+    ports:
+      # Host port 9092 reaches the HOST listener, which advertises
+      # localhost:9092 so tools run outside Docker can connect too.
+      - "9092:29092"
+    environment:
+      # Single-node KRaft: this broker is also the controller, so no
+      # ZooKeeper and no second container to wait on.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # Two client listeners: PLAINTEXT for containers on the compose
+      # network, HOST for clients on the developer's machine. Advertised
+      # addresses must be routable from the client's side, not 0.0.0.0.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # One replica of everything: there is only one broker to put it on.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 20
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  kwatch:
+    build: .
+    container_name: kwatch
+    ports:
+      - "9090:9090"
+    environment:
+      KWATCH_BROKERS: kafka:9092
+      KWATCH_POLL_INTERVAL: 10s
+      KWATCH_POLL_TIMEOUT: 5s
+      KWATCH_LISTEN_ADDR: ":9090"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: kwatch-prometheus
+    ports:
+      # 9091 on the host: kwatch already holds the usual 9090.
+      - "9091:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - kwatch
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: kwatch-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # Local stack only: skip the login wall and land on the dashboard.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

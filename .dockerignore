@@ -1,0 +1,7 @@
+.git
+.github
+.idea
+deploy
+compose.yaml
+Dockerfile
+README.md

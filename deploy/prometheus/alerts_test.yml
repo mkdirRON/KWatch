@@ -1,0 +1,149 @@
+# promtool unit tests for the alert rules.
+#
+#   promtool test rules deploy/prometheus/alerts_test.yml
+#
+# These assert that each rule fires on the situation it is meant to catch, and
+# stays quiet on a healthy cluster.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A group that keeps up must not page anyone.
+  - interval: 1m
+    name: healthy consumer group stays quiet
+    input_series:
+      - series: 'up{job="kwatch", instance="kwatch:9090"}'
+        values: "1+0x40"
+      - series: "kwatch_up"
+        values: "1+0x40"
+      - series: "kwatch_scrape_duration_seconds"
+        values: "0.2+0x40"
+      - series: 'kwatch_consumer_group_lag{group="order_consumer_1", topic="orders", partition="0"}'
+        values: "20 15 25 18 22 19 21 17 23 20 18 22 19 21 20 18 23 19 21 20 22 18 20 19 21 20 18 22 19 21 20 18 23 19 21 20 22 18 20 19 21"
+      - series: 'kwatch_consumer_group_committed_offset{group="order_consumer_1", topic="orders", partition="0"}'
+        values: "1000+500x40"
+      - series: 'kwatch_topic_partition_end_offset{topic="orders", partition="0"}'
+        values: "1020+500x40"
+    alert_rule_test:
+      # The trend crosses the predicted-10k line around 36m and the rule waits
+      # 10m, so it fires at ~46m - while actual lag is still only ~7.7k.
+      - eval_time: 50m
+        alertname: KafkaConsumerLagGrowing
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: KafkaConsumerGroupStalled
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: KafkaConsumerLagHigh
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: KWatchDown
+        exp_alerts: []
+
+  # Lag climbing steadily should page on trend, before it crosses the
+  # absolute 10k threshold that KafkaConsumerLagHigh watches.
+  - interval: 1m
+    name: steadily growing lag fires on trend before the threshold
+    input_series:
+      - series: 'kwatch_consumer_group_lag{group="order_consumer_1", topic="orders", partition="3"}'
+        values: "200+150x60"
+    alert_rule_test:
+      # The trend crosses the predicted-10k line around 36m and the rule waits
+      # 10m, so it fires at ~46m - while actual lag is still only ~7.7k.
+      - eval_time: 50m
+        alertname: KafkaConsumerLagGrowing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              group: order_consumer_1
+              topic: orders
+              partition: "3"
+            exp_annotations:
+              summary: "order_consumer_1 is falling behind on orders"
+              description: >-
+                Lag on partition 3 is trending toward 10k messages within 30
+                minutes. The group is consuming slower than the topic is being
+                produced to.
+      # Still under 10k at this point, so the absolute rule has not fired:
+      # the trend rule bought the team a head start.
+      - eval_time: 50m
+        alertname: KafkaConsumerLagHigh
+        exp_alerts: []
+
+  # A consumer that stops committing while its topic keeps receiving.
+  - interval: 1m
+    name: stalled consumer fires
+    input_series:
+      - series: 'kwatch_consumer_group_committed_offset{group="payment_consumer", topic="payments", partition="0"}'
+        values: "5000+0x30"
+      - series: 'kwatch_topic_partition_end_offset{topic="payments", partition="0"}'
+        values: "5000+200x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: KafkaConsumerGroupStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              group: payment_consumer
+              topic: payments
+              partition: "0"
+            exp_annotations:
+              summary: "payment_consumer has stopped committing on payments"
+              description: >-
+                Partition 0 is still receiving messages but the group's
+                committed offset has not moved in 10 minutes. The consumer is
+                likely dead, wedged, or stuck in a rebalance loop.
+
+  # A backlog deep enough to risk aging out of retention.
+  - interval: 1m
+    name: deep backlog fires critical
+    input_series:
+      - series: 'kwatch_consumer_group_lag{group="order_consumer_1", topic="orders", partition="7"}'
+        values: "150000+0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: KafkaConsumerLagCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              group: order_consumer_1
+              topic: orders
+              partition: "7"
+            exp_annotations:
+              summary: "order_consumer_1 is 150000 messages behind on orders"
+              description: >-
+                Partition 7 is over 100k messages behind. At this depth the
+                backlog is at risk of aging out of retention before the group
+                reaches it.
+
+  # KWatch itself failing is a monitoring outage, not a lag problem.
+  - interval: 1m
+    name: kwatch health rules fire
+    input_series:
+      - series: 'up{job="kwatch", instance="kwatch:9090"}'
+        values: "0+0x20"
+      - series: "kwatch_up"
+        values: "0+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KWatchDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: kwatch
+              instance: kwatch:9090
+            exp_annotations:
+              summary: "KWatch is not reachable"
+              description: "Prometheus cannot scrape KWatch, so consumer lag is unmonitored."
+      - eval_time: 10m
+        alertname: KWatchCannotReachKafka
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "KWatch cannot reach the Kafka cluster"
+              description: >-
+                KWatch is serving metrics but its collection rounds against the
+                Kafka cluster are failing. The lag it reports is stale.
