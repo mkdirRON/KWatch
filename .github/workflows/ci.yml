@@ -1,0 +1,169 @@
+name: CI
+
+# Every push and every pull request runs the full suite, so regressions are
+# caught before merge rather than after.
+on:
+  push:
+  pull_request:
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  alert-rules:
+    name: Alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # promtool runs from the Prometheus image, so CI validates the rules
+      # with the exact binary that will evaluate them.
+      - name: Check Prometheus config and rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v3.1.0 \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: Run alert rule unit tests
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" -w /p \
+            --entrypoint promtool prom/prometheus:v3.1.0 \
+            test rules alerts_test.yml
+
+  integration:
+    name: Integration (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The default shape, and a wider one that checks the collector
+          # holds up as partitions and groups fan out.
+          - name: 20 partitions / 5 groups
+            topics: 2
+            partitions: 20
+            groups: 5
+            messages: 40
+          - name: 64 partitions / 12 groups
+            topics: 3
+            partitions: 64
+            groups: 12
+            messages: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The same compose file developers run locally, so CI and local
+      # runs cannot drift apart.
+      - name: Start Kafka
+        run: docker compose up -d --wait kafka
+
+      - name: Run integration tests
+        env:
+          KWATCH_IT_BROKERS: localhost:9092
+          KWATCH_IT_TOPICS: ${{ matrix.topics }}
+          KWATCH_IT_PARTITIONS: ${{ matrix.partitions }}
+          KWATCH_IT_GROUPS: ${{ matrix.groups }}
+          KWATCH_IT_MESSAGES: ${{ matrix.messages }}
+        run: go test -tags=integration -v -count=1 -timeout=15m ./test/...
+
+      - name: Kafka logs on failure
+        if: failure()
+        run: docker compose logs kafka
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  stack:
+    name: Full stack smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the stack
+        run: docker compose up -d --build --wait kafka kwatch prometheus grafana
+
+      # Proves the built image runs, reaches Kafka, and that Prometheus and
+      # Grafana pick it up with the committed configuration.
+      - name: KWatch reaches Kafka
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf localhost:9090/metrics | grep -q '^kwatch_up 1$'; then
+              echo "kwatch is collecting"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "kwatch never reported a successful collection"
+          curl -s localhost:9090/metrics | grep '^kwatch_' || true
+          exit 1
+
+      - name: Prometheus scrapes KWatch
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf 'localhost:9091/api/v1/targets?state=active' \
+              | jq -e '.data.activeTargets[]
+                       | select(.labels.job=="kwatch" and .health=="up")' >/dev/null; then
+              echo "prometheus target is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "prometheus never marked the kwatch target up"
+          curl -s 'localhost:9091/api/v1/targets?state=active' || true
+          exit 1
+
+      - name: Grafana provisioned the dashboard
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf 'localhost:3000/api/search?query=KWatch' | grep -q 'kwatch-consumer-lag'; then
+              echo "dashboard provisioned"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "grafana did not provision the dashboard"
+          docker compose logs grafana | tail -50
+          exit 1
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
